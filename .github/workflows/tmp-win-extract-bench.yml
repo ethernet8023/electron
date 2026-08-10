@@ -77,6 +77,14 @@ jobs:
         python3 ../src/electron/script/tmp-extract-bench/count_tree.py tree | tee count.txt
         python3 ../src/electron/script/tmp-extract-bench/make_shards.py tree shards 16 | tee shards.txt
         du -sm shards cache.tar.zst
+        # 20000 x 512B files in 40 dirs, used to measure the raw file-create path.
+        python3 -c "
+        import os
+        for d in range(40):
+            p = f'microsrc/micro/d{d}'; os.makedirs(p)
+            for i in range(500): open(f'{p}/f{i}', 'wb').write(b'x' * 512)
+        "
+        tar -cf shards/micro.tar -C microsrc micro
     - name: Linux control benchmark
       shell: bash
       env:
@@ -89,13 +97,15 @@ jobs:
         cat unpack.txt count.txt >> results-linux.md
         echo "" >> results-linux.md
         CACHE_TARBALL=$PWD/cache.tar.zst SHARDS_DIR=$PWD/shards RESULTS=$PWD/results-linux.md \
-          BENCH_ROOT=$PWD/root SCRIPT_DIR=$SCRIPT_DIR bash $SCRIPT_DIR/bench.sh
+          BENCH_ROOT=$PWD/root MICRO_TAR=$PWD/shards/micro.tar SCRIPT_DIR=$SCRIPT_DIR bash $SCRIPT_DIR/bench.sh
         cat results-linux.md >> "$GITHUB_STEP_SUMMARY"
     - name: Upload shards
       uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
       with:
         name: win-cache-shards
-        path: bench/shards/*.tar.zst
+        path: |
+          bench/shards/*.tar.zst
+          bench/shards/micro.tar
         compression-level: 0
         retention-days: 1
     - name: Upload linux results
@@ -183,7 +193,8 @@ jobs:
         Add-Content $out (zstd --version 2>&1 | Out-String)
         Add-Content $out ("msys tar: " + (bash -lc 'tar --version | head -1' 2>&1 | Out-String))
         foreach ($c in @('7z', 'C:\Program Files\7-Zip\7z.exe')) { if (Get-Command $c -ErrorAction SilentlyContinue) { Add-Content $out ("7z: " + $c + " " + ((& $c 2>&1 | Select-Object -First 2) -join ' ')) } }
-        Add-Content $out ("python3: " + (python3 --version 2>&1 | Out-String))
+        foreach ($c in @('python3', 'python', 'py')) { $cmd = Get-Command $c -ErrorAction SilentlyContinue; if ($cmd) { Add-Content $out ("$c -> " + $cmd.Source + " : " + ((& $c --version 2>&1) -join ' ')) } else { Add-Content $out ("$c: not found") } }
+        Add-Content $out ("bash python3: " + (bash -c 'command -v python3 python; true' 2>&1 | Out-String))
         EndSection
         Section "vhd mount capability (VHDX-based cache idea)"
         try { Add-Content $out ((Get-Service -Name vds, vhdmp -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String)); Add-Content $out ((Get-Command Mount-DiskImage -ErrorAction Stop).Name) } catch { Add-Content $out ("Mount-DiskImage unavailable: " + $_) }
@@ -201,7 +212,7 @@ jobs:
         echo "azcopy download of the cache: ${AZCOPY_SECS}s" >> "$R"
         echo "" >> "$R"
         CACHE_TARBALL=$PWD/cache.tar.zst SHARDS_DIR=$PWD/shards RESULTS=$R \
-          BENCH_ROOT=$PWD/root ALT_ROOT="$(cygpath -u "$TEMP")/extract-bench" SCRIPT_DIR=$SCRIPT_DIR \
+          BENCH_ROOT=$PWD/root ALT_ROOT="$(cygpath -u "$TEMP")/extract-bench" MICRO_TAR=$PWD/shards/micro.tar SCRIPT_DIR=$SCRIPT_DIR \
           bash "$SCRIPT_DIR/bench.sh"
     - name: Summary
       if: ${{ !cancelled() }}

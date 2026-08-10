@@ -21,6 +21,26 @@ if [ "$IS_WIN" = 1 ]; then
 fi
 NPROC=$(nproc)
 mkdir -p "$BENCH_ROOT"
+PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' 2>/dev/null; then PY="$c"; break; fi
+done
+echo "python: ${PY:-none}; native tar: $([ -x "$NATIVE_TAR" ] && echo yes || echo no); 7z: ${SEVENZ:-none}"
+
+# count_files <dir> -> "<files> (walk <s> s)"
+count_files() {
+  local d="$1" s e n
+  s=$(date +%s%N)
+  if [ -n "$PY" ]; then
+    n=$("$PY" "$SCRIPT_DIR/count_tree.py" "$d" | cut -d' ' -f1)
+  elif [ "$IS_WIN" = 1 ]; then
+    n=$(MSYS_NO_PATHCONV=1 cmd /c "dir /s /b /a-d $(cygpath -w "$d")" | wc -l | tr -d '[:space:]')
+  else
+    n=$(find "$d" -type f | wc -l | tr -d '[:space:]')
+  fi
+  e=$(date +%s%N)
+  echo "${n} files (walk $(awk "BEGIN{printf \"%.0f\", ($e-$s)/1e9}") s)"
+}
 
 winpath() { if [ "$IS_WIN" = 1 ]; then cygpath -w "$1"; else echo "$1"; fi; }
 
@@ -48,9 +68,8 @@ extract() {
   mkdir -p "$dest"
   bench "$name" "${cmd//DEST/$dest}"
   local secs=$LAST_SECS rc=$LAST_RC
-  counts=$(python3 "$SCRIPT_DIR/count_tree.py" "$dest")
-  local files=${counts%% *} rest=${counts#* } walk=${counts##* }
-  row "$name" "${secs} s" "rc=$rc, ${files} files (walk ${walk} s)" "$4"
+  counts=$(count_files "$dest")
+  row "$name" "${secs} s" "rc=$rc, ${counts}" "$4"
 }
 
 # nuke <name> <dir> <how>   -> row with delete time
@@ -145,10 +164,37 @@ if [ "$IS_WIN" = 1 ] && [ -n "${ALT_ROOT:-}" ] && [ -x "$NATIVE_TAR" ]; then
 fi
 
 # ---- 5. filesystem microbenchmarks -------------------------------------------
-echo "" | tee -a "$RESULTS"
-echo "| fs microbenchmark | wall | rate | " | tee -a "$RESULTS"
-echo "|---|---|---|" | tee -a "$RESULTS"
-python3 "$SCRIPT_DIR/fs_microbench.py" "workspace ($(winpath "$BENCH_ROOT"))" "$BENCH_ROOT/micro" 16 | tee -a "$RESULTS"
-if [ -n "${ALT_ROOT:-}" ]; then
-  python3 "$SCRIPT_DIR/fs_microbench.py" "alt ($(winpath "$ALT_ROOT"))" "$ALT_ROOT/micro" 16 | tee -a "$RESULTS"
+# MICRO_TAR is a plain tar of 20000 x 512B files in 40 dirs (built on Linux).
+# Extracting it exercises exactly the create path the real restore uses.
+micro() {  # <label> <root>
+  local label="$1" root="$2" x
+  mkdir -p "$root"
+  if [ "$IS_WIN" = 1 ] && [ -x "$NATIVE_TAR" ]; then x="\"$NATIVE_TAR\" -xf \"\$(cygpath -w \"$MICRO_TAR\")\" -C \"\$(cygpath -w DEST)\""; else x="tar -xf \"$MICRO_TAR\" -C \"DEST\""; fi
+  mkdir -p "$root/m1"
+  bench "micro [$label]: 20k files, 1 extractor" "${x//DEST/$root/m1}"
+  row "micro [$label]: create 20k files, 1 extractor" "${LAST_SECS} s" "$(awk "BEGIN{printf \"%.0f\", 20000/($LAST_SECS+0.001)}") files/s" "$(count_files "$root/m1")"
+  if [ "$IS_WIN" = 1 ]; then
+    mkdir -p "$root/msys"
+    bench "micro [$label]: 20k files, msys tar" "tar -xf \"$MICRO_TAR\" -C \"$root/msys\""
+    row "micro [$label]: create 20k files, msys tar" "${LAST_SECS} s" "$(awk "BEGIN{printf \"%.0f\", 20000/($LAST_SECS+0.001)}") files/s" ""
+  fi
+  local dests="" n
+  for n in $(seq 1 16); do mkdir -p "$root/p$n"; dests="$dests $root/p$n"; done
+  local xp="${x//DEST/@@}"; xp="${xp//@@/\{\}}"
+  bench "micro [$label]: 16 extractors in parallel (320k files)" "echo$dests | tr ' ' '\\n' | xargs -P 16 -I{} bash -c '$xp'"
+  row "micro [$label]: create 320k files, 16 parallel extractors" "${LAST_SECS} s" "$(awk "BEGIN{printf \"%.0f\", 320000/($LAST_SECS+0.001)}") files/s" "$(count_files "$root")"
+  bench "micro [$label]: dd 2 GiB sequential write" "dd if=/dev/zero of=\"$root/big.bin\" bs=8M count=256 2>&1 | tail -1"
+  row "micro [$label]: sequential write 2 GiB" "${LAST_SECS} s" "$(awk "BEGIN{printf \"%.0f\", 2048/($LAST_SECS+0.001)}") MiB/s" ""
+  rm -f "$root/big.bin"
+  if [ "$IS_WIN" = 1 ]; then nuke "micro [$label] (~360k files)" "$root" rmdir; else nuke "micro [$label] (~360k files)" "$root" rm; fi
+}
+if [ -n "${MICRO_TAR:-}" ] && [ -f "$MICRO_TAR" ]; then
+  micro "workspace $(winpath "$BENCH_ROOT")" "$BENCH_ROOT/micro"
+  if [ -n "${ALT_ROOT:-}" ]; then micro "alt $(winpath "$ALT_ROOT")" "$ALT_ROOT/micro"; fi
+fi
+if [ -n "$PY" ]; then
+  echo "" | tee -a "$RESULTS"
+  echo "| python fs microbenchmark | wall | rate | " | tee -a "$RESULTS"
+  echo "|---|---|---|" | tee -a "$RESULTS"
+  "$PY" "$SCRIPT_DIR/fs_microbench.py" "workspace" "$BENCH_ROOT/pymicro" 16 | tee -a "$RESULTS"
 fi
