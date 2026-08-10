@@ -16,6 +16,8 @@ $drive = (Get-Item $env:GITHUB_WORKSPACE).PSDrive.Name + ":"
 Add-Content $out ((Get-Volume | Where-Object DriveLetter | Format-Table DriveLetter, FileSystemType, DriveType, @{n='SizeGB';e={[math]::Round($_.Size/1GB)}}, @{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB)}} | Out-String))
 Add-Content $out (fsutil fsinfo volumeinfo $drive 2>&1 | Out-String)
 Add-Content $out (fsutil 8dot3name query $drive 2>&1 | Out-String)
+Add-Content $out ("global 8dot3 setting: " + (fsutil 8dot3name query 2>&1 | Out-String))
+Add-Content $out ("workspace volume as seen from inside: " + (fsutil fsinfo volumeinfo $drive 2>&1 | Select-String 'File System Name|Volume Name' | Out-String))
 EndSection
 Section "filter drivers (fltmc) - bindflt/wcifs = container bind-mount layer"
 Add-Content $out (fltmc filters 2>&1 | Out-String)

@@ -117,14 +117,23 @@ jobs:
           bench/shards.txt
         retention-days: 7
 
+  # The 16-core set is what build.yml uses today (D16lds_v5 nodes); the
+  # 32-core set is the newer pool (D32ads_v7 nodes) - same container image and
+  # emptyDir workspace, different VM generation and local disk.
   bench-windows:
+    name: bench-windows (${{ matrix.pool }})
     needs: prepare-linux
-    runs-on: electron-arc-centralus-windows-amd64-16core
+    strategy:
+      fail-fast: false
+      matrix:
+        pool: [16core, 32core]
+    runs-on: electron-arc-centralus-windows-amd64-${{ matrix.pool }}
     timeout-minutes: 300
     permissions:
       contents: read
     env:
       CACHE_FILE: ${{ needs.prepare-linux.outputs.cache-file }}
+      POOL: ${{ matrix.pool }}
     defaults:
       run:
         shell: bash
@@ -171,7 +180,7 @@ jobs:
         cd bench
         SCRIPT_DIR=$(cygpath -u "$SCRIPT_DIR")
         R=$PWD/results-windows.md
-        echo "## Windows build runner ($RUNNER_NAME)" > "$R"
+        echo "## Windows build runner: ${POOL} pool ($RUNNER_NAME, $(nproc) cpus)" > "$R"
         echo "" >> "$R"
         echo "azcopy download of the cache: ${AZCOPY_SECS}s" >> "$R"
         echo "" >> "$R"
@@ -209,7 +218,7 @@ jobs:
       if: ${{ !cancelled() }}
       uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
       with:
-        name: results-windows
+        name: results-windows-${{ matrix.pool }}
         path: |
           bench/results-windows.md
           bench/probe.md
