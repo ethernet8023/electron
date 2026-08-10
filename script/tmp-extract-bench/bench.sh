@@ -8,7 +8,13 @@
 #      BENCH_ROOT     directory to extract into (inside the workspace)
 #      ALT_ROOT       optional second directory outside the workspace
 #      SCRIPT_DIR     directory containing count_tree.py etc.
+#      MICRO_TAR      optional plain tar of 20000 small files
+#      SUITE          "full" (default: everything, into BENCH_ROOT) or "fs"
+#                     (the core extractors + micro only, into BENCH_ROOT - used
+#                     to compare destination filesystems)
+#      LABEL          optional heading written before this invocation's rows
 set -u
+SUITE=${SUITE:-full}
 
 IS_WIN=0
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) IS_WIN=1;; esac
@@ -85,6 +91,7 @@ nuke() {
   rm -rf "$dir" 2>/dev/null || true
 }
 
+{ echo ""; [ -n "${LABEL:-}" ] && echo "### $LABEL" && echo ""; echo "destination: $(winpath "$BENCH_ROOT") ($(df -T "$BENCH_ROOT" 2>/dev/null | awk 'NR==2{print $2}' ) per df; free $(df -m "$BENCH_ROOT" | awk 'NR==2{print $4}') MiB)"; echo ""; } | tee -a "$RESULTS"
 echo "| benchmark | wall | result | notes |" | tee -a "$RESULTS"
 echo "|---|---|---|---|" | tee -a "$RESULTS"
 
@@ -94,11 +101,13 @@ NSHARDS=$(ls "$SHARDS_DIR"/*.tar.zst | wc -l)
 row "inputs" "" "cache ${CACHE_MB} MiB (zstd --long=30), $(ls "$SHARDS_DIR"/*.tar.zst | wc -l) shards ${SHARD_MB} MiB total, ${NPROC} cpus" ""
 
 # ---- 0. costs that don't touch the destination filesystem -------------------
+if [ "$SUITE" = full ]; then
 bench "zstd decompress only (to /dev/null)" "zstd -d --long=30 -c \"$CACHE_TARBALL\" > /dev/null"
 row "zstd -d --long=30 → /dev/null" "${LAST_SECS} s" "rc=$LAST_RC" "decompression floor; no file creation"
 
 bench "zstd | msys tar -t (list only)" "zstd -d --long=30 -c \"$CACHE_TARBALL\" | tar -tf - | wc -l > \"$BENCH_ROOT/entries.txt\""
 row "zstd \| tar -t (parse only)" "${LAST_SECS} s" "$(cat "$BENCH_ROOT/entries.txt") entries" "tar header parsing floor; no file creation"
+fi
 
 # ---- 1. single stream extractors --------------------------------------------
 D="$BENCH_ROOT/x"
@@ -113,7 +122,7 @@ fi
 # ---- 2. decompress to disk first, then extract from a plain .tar -------------
 FREE_MB=$(df -m "$BENCH_ROOT" | awk 'NR==2{print $4}')
 RAW="$BENCH_ROOT/cache.tar"
-if [ "$IS_WIN" = 1 ] && [ "$FREE_MB" -gt 70000 ]; then
+if [ "$SUITE" = full ] && [ "$IS_WIN" = 1 ] && [ "$FREE_MB" -gt 70000 ]; then
   bench "zstd -d to a .tar on disk" "zstd -d --long=30 -f -o \"$RAW\" \"$CACHE_TARBALL\""
   row "zstd -d → cache.tar on disk" "${LAST_SECS} s" "rc=$LAST_RC, $(( $(stat -c %s "$RAW") / 1048576 )) MiB" "one-off cost added to the from-disk variants below"
   if [ "$IS_WIN" = 1 ] && [ -x "$NATIVE_TAR" ]; then
@@ -127,7 +136,7 @@ if [ "$IS_WIN" = 1 ] && [ "$FREE_MB" -gt 70000 ]; then
     row "7z x from cache.tar" "skipped" "7z not on this runner" ""
   fi
   rm -f "$RAW"
-elif [ "$IS_WIN" = 1 ]; then
+elif [ "$SUITE" = full ] && [ "$IS_WIN" = 1 ]; then
   row "from-disk .tar variants" "skipped" "only ${FREE_MB} MiB free" ""
 fi
 
@@ -142,12 +151,15 @@ shard_cmd() {  # <parallelism> <extractor: native|msys>
   echo "ls \"$SHARDS_DIR\"/*.tar.zst | xargs -P $p -I{} bash -o pipefail -c 'zstd -d -c {} | $x'"
 }
 if [ "$IS_WIN" = 1 ] && [ -x "$NATIVE_TAR" ]; then
-  for p in 1 4 8 16; do
+  if [ "$SUITE" = full ]; then PLIST="1 4 8 16"; else PLIST="4 16"; fi
+  for p in $PLIST; do
     extract "shards: bsdtar, ${p} parallel" "$D" "$(shard_cmd $p native)" "${NSHARDS} shards, xargs -P ${p}"
     nuke "shards bsdtar P${p} tree" "$D" rmdir
   done
-  extract "shards: msys tar, 16 parallel" "$D" "$(shard_cmd 16 msys)" "does msys tar scale too?"
-  nuke "shards msys P16 tree" "$D" rmdir
+  if [ "$SUITE" = full ]; then
+    extract "shards: msys tar, 16 parallel" "$D" "$(shard_cmd 16 msys)" "does msys tar scale too?"
+    nuke "shards msys P16 tree" "$D" rmdir
+  fi
 else
   for p in 1 16; do
     extract "shards: tar, ${p} parallel" "$D" "$(shard_cmd $p msys)" "${NSHARDS} shards, xargs -P ${p}"
@@ -156,7 +168,7 @@ else
 fi
 
 # ---- 4. same extractor, different location -----------------------------------
-if [ "$IS_WIN" = 1 ] && [ -n "${ALT_ROOT:-}" ] && [ -x "$NATIVE_TAR" ]; then
+if [ "$SUITE" = full ] && [ "$IS_WIN" = 1 ] && [ -n "${ALT_ROOT:-}" ] && [ -x "$NATIVE_TAR" ]; then
   mkdir -p "$ALT_ROOT"
   A="$ALT_ROOT/x"
   extract "shards: bsdtar, 16 parallel → ALT_ROOT ($(winpath "$ALT_ROOT"))" "$A" "$(shard_cmd 16 native)" "is the workspace path slower than elsewhere on the box?"
@@ -189,10 +201,10 @@ micro() {  # <label> <root>
   if [ "$IS_WIN" = 1 ]; then nuke "micro [$label] (~360k files)" "$root" rmdir; else nuke "micro [$label] (~360k files)" "$root" rm; fi
 }
 if [ -n "${MICRO_TAR:-}" ] && [ -f "$MICRO_TAR" ]; then
-  micro "workspace $(winpath "$BENCH_ROOT")" "$BENCH_ROOT/micro"
-  if [ -n "${ALT_ROOT:-}" ]; then micro "alt $(winpath "$ALT_ROOT")" "$ALT_ROOT/micro"; fi
+  micro "$(winpath "$BENCH_ROOT")" "$BENCH_ROOT/micro"
+  if [ "$SUITE" = full ] && [ -n "${ALT_ROOT:-}" ]; then micro "alt $(winpath "$ALT_ROOT")" "$ALT_ROOT/micro"; fi
 fi
-if [ -n "$PY" ]; then
+if [ "$SUITE" = full ] && [ -n "$PY" ]; then
   echo "" | tee -a "$RESULTS"
   echo "| python fs microbenchmark | wall | rate | " | tee -a "$RESULTS"
   echo "|---|---|---|" | tee -a "$RESULTS"

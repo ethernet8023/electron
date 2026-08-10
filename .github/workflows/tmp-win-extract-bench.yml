@@ -163,43 +163,7 @@ jobs:
     - name: Probe the runner
       shell: powershell
       continue-on-error: true
-      run: |
-        $out = "bench/probe.md"
-        function Section($t) { Add-Content $out "`n### $t`n"; Add-Content $out '```' }
-        function EndSection { Add-Content $out '```' }
-        Section "host"
-        Add-Content $out ("workspace: " + $env:GITHUB_WORKSPACE)
-        Add-Content $out ("cpus: " + [Environment]::ProcessorCount)
-        Add-Content $out ((Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, TotalVisibleMemorySize, FreePhysicalMemory) | Format-List | Out-String)
-        Add-Content $out ("user: " + [Security.Principal.WindowsIdentity]::GetCurrent().Name)
-        Add-Content $out ("in container: " + (Test-Path Env:CONTAINER_SANDBOX_MOUNT_POINT))
-        EndSection
-        Section "volumes"
-        Add-Content $out (Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, Root | Out-String)
-        $drive = (Get-Item $env:GITHUB_WORKSPACE).PSDrive.Name + ":"
-        Add-Content $out (fsutil fsinfo volumeinfo $drive 2>&1 | Out-String)
-        Add-Content $out (fsutil 8dot3name query $drive 2>&1 | Out-String)
-        EndSection
-        Section "filter drivers (fltmc) - bindflt/wcifs = container bind-mount layer"
-        Add-Content $out (fltmc filters 2>&1 | Out-String)
-        Add-Content $out (fltmc instances -v $drive 2>&1 | Out-String)
-        EndSection
-        Section "defender"
-        try { Add-Content $out (Get-MpComputerStatus | Select-Object AMServiceEnabled, RealTimeProtectionEnabled, AntivirusEnabled | Format-List | Out-String) } catch { Add-Content $out ("Get-MpComputerStatus failed: " + $_) }
-        Add-Content $out ((Get-Service -Name WinDefend, MsMpEng -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String))
-        EndSection
-        Section "tools"
-        Add-Content $out (& "$env:SystemRoot\System32\tar.exe" --version 2>&1 | Out-String)
-        Add-Content $out (zstd --version 2>&1 | Out-String)
-        Add-Content $out ("msys tar: " + (bash -lc 'tar --version | head -1' 2>&1 | Out-String))
-        foreach ($c in @('7z', 'C:\Program Files\7-Zip\7z.exe')) { if (Get-Command $c -ErrorAction SilentlyContinue) { Add-Content $out ("7z: " + $c + " " + ((& $c 2>&1 | Select-Object -First 2) -join ' ')) } }
-        foreach ($c in @('python3', 'python', 'py')) { $cmd = Get-Command $c -ErrorAction SilentlyContinue; if ($cmd) { Add-Content $out ("$c -> " + $cmd.Source + " : " + ((& $c --version 2>&1) -join ' ')) } else { Add-Content $out ("$c: not found") } }
-        Add-Content $out ("bash python3: " + (bash -c 'command -v python3 python; true' 2>&1 | Out-String))
-        EndSection
-        Section "vhd mount capability (VHDX-based cache idea)"
-        try { Add-Content $out ((Get-Service -Name vds, vhdmp -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String)); Add-Content $out ((Get-Command Mount-DiskImage -ErrorAction Stop).Name) } catch { Add-Content $out ("Mount-DiskImage unavailable: " + $_) }
-        EndSection
-        Get-Content $out
+      run: powershell -ExecutionPolicy Bypass -File src/electron/script/tmp-extract-bench/probe.ps1 bench/probe.md
     - name: Run benchmarks
       env:
         SCRIPT_DIR: ${{ github.workspace }}/src/electron/script/tmp-extract-bench
@@ -211,8 +175,29 @@ jobs:
         echo "" >> "$R"
         echo "azcopy download of the cache: ${AZCOPY_SECS}s" >> "$R"
         echo "" >> "$R"
-        CACHE_TARBALL=$PWD/cache.tar.zst SHARDS_DIR=$PWD/shards RESULTS=$R \
+        LABEL="destination = workspace volume (NTFS as provisioned) on the build runner" \
+          CACHE_TARBALL=$PWD/cache.tar.zst SHARDS_DIR=$PWD/shards RESULTS=$R \
           BENCH_ROOT=$PWD/root ALT_ROOT="$(cygpath -u "$TEMP")/extract-bench" MICRO_TAR=$PWD/shards/micro.tar SCRIPT_DIR=$SCRIPT_DIR \
+          bash "$SCRIPT_DIR/bench.sh"
+    - name: Try to create a ReFS Dev Drive on this runner
+      id: refs
+      shell: powershell
+      continue-on-error: true
+      run: powershell -ExecutionPolicy Bypass -File src/electron/script/tmp-extract-bench/make-refs-drive.ps1
+    - name: Benchmark on the ReFS drive (if we got one)
+      if: ${{ !cancelled() }}
+      env:
+        SCRIPT_DIR: ${{ github.workspace }}/src/electron/script/tmp-extract-bench
+      run: |
+        cd bench
+        if [ -z "${REFS_ROOT:-}" ]; then
+          { echo ""; echo "### ReFS on this runner: NOT AVAILABLE"; echo ""; echo "make-refs-drive.ps1 outcome: ${{ steps.refs.outcome }} - see that step's log (expected inside a container: no virtual-disk stack)."; } | tee -a results-windows.md
+          exit 0
+        fi
+        SCRIPT_DIR=$(cygpath -u "$SCRIPT_DIR")
+        SUITE=fs LABEL="destination = ${REFS_KIND} (${REFS_ROOT}) on the build runner" \
+          CACHE_TARBALL=$PWD/cache.tar.zst SHARDS_DIR=$PWD/shards RESULTS=$PWD/results-windows.md \
+          BENCH_ROOT="$(cygpath -u "$REFS_ROOT")/root" MICRO_TAR=$PWD/shards/micro.tar SCRIPT_DIR=$SCRIPT_DIR \
           bash "$SCRIPT_DIR/bench.sh"
     - name: Summary
       if: ${{ !cancelled() }}
@@ -228,4 +213,119 @@ jobs:
         path: |
           bench/results-windows.md
           bench/probe.md
+        retention-days: 7
+
+  # Same inputs on a GitHub-hosted Windows VM (a real VM, so a VHDX can be
+  # mounted): the destination filesystem is the only variable between the
+  # three passes - NTFS as shipped (Defender on), NTFS with the destination
+  # excluded from Defender, and a trusted ReFS Dev Drive.
+  bench-hosted-vm:
+    needs: prepare-linux
+    runs-on: windows-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    env:
+      CACHE_FILE: ${{ needs.prepare-linux.outputs.cache-file }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Checkout bench scripts
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        path: src/electron
+        sparse-checkout: script/tmp-extract-bench
+    - name: Create ReFS Dev Drive
+      shell: powershell
+      run: powershell -ExecutionPolicy Bypass -File src/electron/script/tmp-extract-bench/make-refs-drive.ps1
+    - name: Pick a scratch dir on the roomiest host volume
+      shell: powershell
+      run: |
+        $vol = Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' -and $_.FileSystemType -eq 'NTFS' } | Sort-Object SizeRemaining -Descending | Select-Object -First 1
+        $scratch = "$($vol.DriveLetter):\extract-bench"
+        New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+        "HOST_SCRATCH=$scratch" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+        Write-Host "scratch: $scratch ($([math]::Round($vol.SizeRemaining/1GB)) GB free)"
+    - name: Install zstd if missing
+      run: command -v zstd || choco install zstandard -y --no-progress
+    - name: Obtain SAS Key
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        path: sas-token
+        key: sas-key-win-${{ github.run_number }}-${{ github.run_attempt }}
+        restore-keys: sas-key-win-${{ github.run_number }}-
+        enableCrossOsArchive: true
+        fail-on-cache-miss: true
+    - name: Download src cache (azcopy)
+      env:
+        AZURE_AKS_WIN_CACHE_SHARE_NAME: windows-cache
+      run: |
+        S=$(cygpath -u "$HOST_SCRATCH")
+        sas_token=$(jq -r '.sasToken' sas-token)
+        account_name=$(jq -r '.accountName' sas-token)
+        rm -f sas-token
+        s=$(date +%s)
+        azcopy copy --log-level=ERROR "https://$account_name.file.core.windows.net/$AZURE_AKS_WIN_CACHE_SHARE_NAME/$CACHE_FILE?$sas_token" "$S/cache.tar.zst"
+        e=$(date +%s)
+        echo "AZCOPY_SECS=$((e-s))" >> "$GITHUB_ENV"
+        ls -la "$S/cache.tar.zst"
+    - name: Download shards
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: win-cache-shards
+        path: ${{ env.HOST_SCRATCH }}/shards
+    - name: Probe the runner
+      shell: powershell
+      continue-on-error: true
+      run: powershell -ExecutionPolicy Bypass -File src/electron/script/tmp-extract-bench/probe.ps1 "$env:HOST_SCRATCH\probe.md"
+    - name: Pass 1 - NTFS host volume, Defender as shipped
+      env:
+        SCRIPT_DIR: ${{ github.workspace }}/src/electron/script/tmp-extract-bench
+      run: |
+        S=$(cygpath -u "$HOST_SCRATCH"); SCRIPT_DIR=$(cygpath -u "$SCRIPT_DIR")
+        R=$S/results-hosted-vm.md
+        { echo "## GitHub-hosted Windows VM (windows-latest, $(nproc) cpus) - same cache, three destination filesystems"; echo ""; echo "azcopy download of the cache: ${AZCOPY_SECS}s"; } > "$R"
+        SUITE=fs LABEL="destination = NTFS ($HOST_SCRATCH), Defender real-time protection as shipped" \
+          CACHE_TARBALL=$S/cache.tar.zst SHARDS_DIR=$S/shards RESULTS=$R BENCH_ROOT=$S/ntfs MICRO_TAR=$S/shards/micro.tar SCRIPT_DIR=$SCRIPT_DIR \
+          bash "$SCRIPT_DIR/bench.sh"
+    - name: Exclude the NTFS destination from Defender
+      shell: powershell
+      continue-on-error: true
+      run: |
+        Add-MpPreference -ExclusionPath "$env:HOST_SCRATCH\ntfs-excluded"
+        Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+        Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled | Format-List
+    - name: Pass 2 - NTFS host volume, destination excluded from Defender
+      if: ${{ !cancelled() }}
+      env:
+        SCRIPT_DIR: ${{ github.workspace }}/src/electron/script/tmp-extract-bench
+      run: |
+        S=$(cygpath -u "$HOST_SCRATCH"); SCRIPT_DIR=$(cygpath -u "$SCRIPT_DIR")
+        SUITE=fs LABEL="destination = NTFS ($HOST_SCRATCH\ntfs-excluded), excluded from Defender" \
+          CACHE_TARBALL=$S/cache.tar.zst SHARDS_DIR=$S/shards RESULTS=$S/results-hosted-vm.md BENCH_ROOT=$S/ntfs-excluded MICRO_TAR=$S/shards/micro.tar SCRIPT_DIR=$SCRIPT_DIR \
+          bash "$SCRIPT_DIR/bench.sh"
+    - name: Pass 3 - ReFS Dev Drive
+      if: ${{ !cancelled() }}
+      env:
+        SCRIPT_DIR: ${{ github.workspace }}/src/electron/script/tmp-extract-bench
+      run: |
+        S=$(cygpath -u "$HOST_SCRATCH"); SCRIPT_DIR=$(cygpath -u "$SCRIPT_DIR")
+        SUITE=fs LABEL="destination = ${REFS_KIND} (${REFS_ROOT}), trusted" \
+          CACHE_TARBALL=$S/cache.tar.zst SHARDS_DIR=$S/shards RESULTS=$S/results-hosted-vm.md BENCH_ROOT="$(cygpath -u "$REFS_ROOT")/root" MICRO_TAR=$S/shards/micro.tar SCRIPT_DIR=$SCRIPT_DIR \
+          bash "$SCRIPT_DIR/bench.sh"
+    - name: Summary
+      if: ${{ !cancelled() }}
+      run: |
+        S=$(cygpath -u "$HOST_SCRATCH")
+        cat "$S/results-hosted-vm.md" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        cat "$S/probe.md" >> "$GITHUB_STEP_SUMMARY" || true
+        mkdir -p out && cp "$S"/results-hosted-vm.md "$S"/probe.md out/ 2>/dev/null || true
+    - name: Upload results
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      with:
+        name: results-hosted-vm
+        path: out/
         retention-days: 7
