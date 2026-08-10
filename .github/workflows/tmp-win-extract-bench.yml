@@ -1,0 +1,220 @@
+# TEMPORARY - benchmarks the ways of unpacking the src cache on the Windows
+# build runners. Lives on a throwaway branch; delete with the branch.
+name: TMP Windows src cache extraction benchmark
+
+on:
+  push:
+    branches:
+      - build/tmp-win-extract-bench
+
+permissions: {}
+
+jobs:
+  setup:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    outputs:
+      build-image-sha: ${{ steps.build-image-sha.outputs.build-image-sha }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - id: build-image-sha
+      uses: ./.github/actions/build-image-sha
+
+  # Same as build.yml's checkout-windows: makes sure the win src cache exists
+  # for this DEPS hash and mints a SAS token for it. Then, as the Linux
+  # control group, unpacks the same cache here and cuts it into shards for the
+  # parallel-extraction variants.
+  prepare-linux:
+    needs: setup
+    runs-on: electron-arc-centralus-linux-amd64-32core
+    permissions:
+      contents: read
+    container:
+      image: ghcr.io/electron/build:${{ needs.setup.outputs.build-image-sha }}
+      options: --user root --device /dev/fuse --cap-add SYS_ADMIN
+      volumes:
+        - /mnt/win-cache:/mnt/win-cache
+        - /var/run/sas:/var/run/sas
+    env:
+      CHROMIUM_GIT_COOKIE: ${{ secrets.CHROMIUM_GIT_COOKIE }}
+      CHROMIUM_GIT_COOKIE_WINDOWS_STRING: ${{ secrets.CHROMIUM_GIT_COOKIE_WINDOWS_STRING }}
+      GCLIENT_EXTRA_ARGS: '--custom-var=checkout_win=True'
+      TARGET_OS: 'win'
+      ELECTRON_DEPOT_TOOLS_WIN_TOOLCHAIN: '1'
+    outputs:
+      cache-file: ${{ steps.info.outputs.cache-file }}
+    steps:
+    - name: Checkout Electron
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        path: src/electron
+        fetch-depth: 0
+    - name: Checkout & Sync & Save
+      uses: ./src/electron/.github/actions/checkout
+      with:
+        generate-sas-token: 'true'
+        target-platform: win
+    - name: Export cache info
+      id: info
+      shell: bash
+      run: |
+        echo "cache-file=$CACHE_FILE" >> "$GITHUB_OUTPUT"
+        ls -la "$CACHE_DRIVE/$CACHE_FILE"
+    - name: Copy cache off the share
+      shell: bash
+      run: |
+        mkdir -p bench
+        s=$(date +%s); cp "$CACHE_DRIVE/$CACHE_FILE" bench/cache.tar.zst; e=$(date +%s)
+        echo "copied $(du -m bench/cache.tar.zst | cut -f1) MiB from the share in $((e-s))s"
+    - name: Unpack once and build shards
+      shell: bash
+      run: |
+        cd bench
+        mkdir tree
+        s=$(date +%s%N); zstd -d --long=30 -c cache.tar.zst | tar -xf - -C tree; e=$(date +%s%N)
+        echo "linux single-stream unpack: $(( (e-s)/1000000 )) ms" | tee unpack.txt
+        python3 ../src/electron/script/tmp-extract-bench/count_tree.py tree | tee count.txt
+        python3 ../src/electron/script/tmp-extract-bench/make_shards.py tree shards 16 | tee shards.txt
+        du -sm shards cache.tar.zst
+    - name: Linux control benchmark
+      shell: bash
+      env:
+        SCRIPT_DIR: ${{ github.workspace }}/src/electron/script/tmp-extract-bench
+      run: |
+        cd bench
+        rm -rf tree
+        echo "## Linux control (${RUNNER_NAME:-linux 32-core}, same cache file)" > results-linux.md
+        echo "" >> results-linux.md
+        cat unpack.txt count.txt >> results-linux.md
+        echo "" >> results-linux.md
+        CACHE_TARBALL=$PWD/cache.tar.zst SHARDS_DIR=$PWD/shards RESULTS=$PWD/results-linux.md \
+          BENCH_ROOT=$PWD/root SCRIPT_DIR=$SCRIPT_DIR bash $SCRIPT_DIR/bench.sh
+        cat results-linux.md >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload shards
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      with:
+        name: win-cache-shards
+        path: bench/shards/*.tar.zst
+        compression-level: 0
+        retention-days: 1
+    - name: Upload linux results
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      with:
+        name: results-linux
+        path: |
+          bench/results-linux.md
+          bench/shards.txt
+        retention-days: 7
+
+  bench-windows:
+    needs: prepare-linux
+    runs-on: electron-arc-centralus-windows-amd64-16core
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    env:
+      CACHE_FILE: ${{ needs.prepare-linux.outputs.cache-file }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Checkout bench scripts
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        path: src/electron
+        sparse-checkout: script/tmp-extract-bench
+    - name: Obtain SAS Key
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        path: sas-token
+        key: sas-key-win-${{ github.run_number }}-${{ github.run_attempt }}
+        restore-keys: sas-key-win-${{ github.run_number }}-
+        enableCrossOsArchive: true
+        fail-on-cache-miss: true
+    - name: Download src cache (azcopy)
+      env:
+        AZURE_AKS_WIN_CACHE_SHARE_NAME: windows-cache
+      run: |
+        mkdir -p bench
+        sas_token=$(jq -r '.sasToken' sas-token)
+        account_name=$(jq -r '.accountName' sas-token)
+        rm -f sas-token
+        s=$(date +%s)
+        azcopy copy --log-level=ERROR "https://$account_name.file.core.windows.net/$AZURE_AKS_WIN_CACHE_SHARE_NAME/$CACHE_FILE?$sas_token" bench/cache.tar.zst
+        e=$(date +%s)
+        echo "AZCOPY_SECS=$((e-s))" >> "$GITHUB_ENV"
+        ls -la bench/cache.tar.zst
+    - name: Download shards
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: win-cache-shards
+        path: bench/shards
+    - name: Probe the runner
+      shell: powershell
+      continue-on-error: true
+      run: |
+        $out = "bench/probe.md"
+        function Section($t) { Add-Content $out "`n### $t`n"; Add-Content $out '```' }
+        function EndSection { Add-Content $out '```' }
+        Section "host"
+        Add-Content $out ("workspace: " + $env:GITHUB_WORKSPACE)
+        Add-Content $out ("cpus: " + [Environment]::ProcessorCount)
+        Add-Content $out ((Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, TotalVisibleMemorySize, FreePhysicalMemory) | Format-List | Out-String)
+        Add-Content $out ("user: " + [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+        Add-Content $out ("in container: " + (Test-Path Env:CONTAINER_SANDBOX_MOUNT_POINT))
+        EndSection
+        Section "volumes"
+        Add-Content $out (Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, Root | Out-String)
+        $drive = (Get-Item $env:GITHUB_WORKSPACE).PSDrive.Name + ":"
+        Add-Content $out (fsutil fsinfo volumeinfo $drive 2>&1 | Out-String)
+        Add-Content $out (fsutil 8dot3name query $drive 2>&1 | Out-String)
+        EndSection
+        Section "filter drivers (fltmc) - bindflt/wcifs = container bind-mount layer"
+        Add-Content $out (fltmc filters 2>&1 | Out-String)
+        Add-Content $out (fltmc instances -v $drive 2>&1 | Out-String)
+        EndSection
+        Section "defender"
+        try { Add-Content $out (Get-MpComputerStatus | Select-Object AMServiceEnabled, RealTimeProtectionEnabled, AntivirusEnabled | Format-List | Out-String) } catch { Add-Content $out ("Get-MpComputerStatus failed: " + $_) }
+        Add-Content $out ((Get-Service -Name WinDefend, MsMpEng -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String))
+        EndSection
+        Section "tools"
+        Add-Content $out (& "$env:SystemRoot\System32\tar.exe" --version 2>&1 | Out-String)
+        Add-Content $out (zstd --version 2>&1 | Out-String)
+        Add-Content $out ("msys tar: " + (bash -lc 'tar --version | head -1' 2>&1 | Out-String))
+        foreach ($c in @('7z', 'C:\Program Files\7-Zip\7z.exe')) { if (Get-Command $c -ErrorAction SilentlyContinue) { Add-Content $out ("7z: " + $c + " " + ((& $c 2>&1 | Select-Object -First 2) -join ' ')) } }
+        Add-Content $out ("python3: " + (python3 --version 2>&1 | Out-String))
+        EndSection
+        Section "vhd mount capability (VHDX-based cache idea)"
+        try { Add-Content $out ((Get-Service -Name vds, vhdmp -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String)); Add-Content $out ((Get-Command Mount-DiskImage -ErrorAction Stop).Name) } catch { Add-Content $out ("Mount-DiskImage unavailable: " + $_) }
+        EndSection
+        Get-Content $out
+    - name: Run benchmarks
+      env:
+        SCRIPT_DIR: ${{ github.workspace }}/src/electron/script/tmp-extract-bench
+      run: |
+        cd bench
+        SCRIPT_DIR=$(cygpath -u "$SCRIPT_DIR")
+        R=$PWD/results-windows.md
+        echo "## Windows build runner ($RUNNER_NAME)" > "$R"
+        echo "" >> "$R"
+        echo "azcopy download of the cache: ${AZCOPY_SECS}s" >> "$R"
+        echo "" >> "$R"
+        CACHE_TARBALL=$PWD/cache.tar.zst SHARDS_DIR=$PWD/shards RESULTS=$R \
+          BENCH_ROOT=$PWD/root ALT_ROOT="$(cygpath -u "$TEMP")/extract-bench" SCRIPT_DIR=$SCRIPT_DIR \
+          bash "$SCRIPT_DIR/bench.sh"
+    - name: Summary
+      if: ${{ !cancelled() }}
+      run: |
+        cat bench/results-windows.md >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        cat bench/probe.md >> "$GITHUB_STEP_SUMMARY" || true
+    - name: Upload results
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      with:
+        name: results-windows
+        path: |
+          bench/results-windows.md
+          bench/probe.md
+        retention-days: 7
